@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,15 +11,15 @@ import (
 	"github.com/go-kit/kit/log/level"
 )
 
-// ErrNotEmpty is returned when a delete request comes for a non-empty key,
-// or when an identity read is performed as part of garbage collection and
-// a non-empty state is returned.
-var ErrNotEmpty = errors.New("not empty")
+// ErrNotEqual indicates the tombstone value sent as part of a delete request
+// doesn't correspond to the stored value we have for that key.
+var ErrNotEqual = errors.New("not equal")
 
 // MemoryAcceptor persists data in-memory.
 type MemoryAcceptor struct {
 	mtx    sync.Mutex
 	addr   string
+	ages   map[string]Age
 	values map[string]acceptedValue
 	logger log.Logger
 }
@@ -39,6 +40,7 @@ var zeroballot Ballot
 func NewMemoryAcceptor(addr string, logger log.Logger) *MemoryAcceptor {
 	return &MemoryAcceptor{
 		addr:   addr,
+		ages:   map[string]Age{},
 		values: map[string]acceptedValue{},
 		logger: logger,
 	}
@@ -50,16 +52,23 @@ func (a *MemoryAcceptor) Address() string {
 }
 
 // Prepare implements the first-phase responsibilities of an acceptor.
-func (a *MemoryAcceptor) Prepare(ctx context.Context, key string, b Ballot) (value []byte, current Ballot, err error) {
+func (a *MemoryAcceptor) Prepare(ctx context.Context, key string, age Age, b Ballot) (value []byte, current Ballot, err error) {
 	defer func() {
 		level.Debug(a.logger).Log(
-			"method", "Prepare", "key", key, "B", b,
+			"method", "Prepare", "key", key, "age", age, "B", b,
 			"success", err == nil, "return_ballot", current, "err", err,
 		)
 	}()
 
 	a.mtx.Lock()
 	defer a.mtx.Unlock()
+
+	// From the GC section of the paper: "Acceptors [should] reject messages
+	// from proposers if [the incoming age] is younger than the corresponding
+	// age [that was previously accepted]."
+	if incoming, existing := age, a.ages[age.ID]; incoming.youngerThan(existing) {
+		return nil, zeroballot, AgeError{Incoming: incoming, Existing: existing}
+	}
 
 	// Select the promise/accepted/value tuple for this key.
 	// A zero value is useful.
@@ -97,16 +106,23 @@ func (a *MemoryAcceptor) Prepare(ctx context.Context, key string, b Ballot) (val
 }
 
 // Accept implements the second-phase responsibilities of an acceptor.
-func (a *MemoryAcceptor) Accept(ctx context.Context, key string, b Ballot, value []byte) (err error) {
+func (a *MemoryAcceptor) Accept(ctx context.Context, key string, age Age, b Ballot, value []byte) (err error) {
 	defer func() {
 		level.Debug(a.logger).Log(
-			"method", "Accept", "key", key, "B", b,
+			"method", "Accept", "key", key, "age", age, "B", b,
 			"success", err == nil, "err", err,
 		)
 	}()
 
 	a.mtx.Lock()
 	defer a.mtx.Unlock()
+
+	// From the GC section of the paper: "Acceptors [should] reject messages
+	// from proposers if [the incoming age] is younger than the corresponding
+	// age [that was previously accepted]."
+	if incoming, existing := age, a.ages[age.ID]; incoming.youngerThan(existing) {
+		return AgeError{Incoming: incoming, Existing: existing}
+	}
 
 	// Select the promise/accepted/value tuple for this key.
 	// A zero value is useful.
@@ -137,12 +153,36 @@ func (a *MemoryAcceptor) Accept(ctx context.Context, key string, b Ballot, value
 	return nil
 }
 
-// RemoveIfEmpty implements the garbage collection responsibilities of an
-// acceptor.
-func (a *MemoryAcceptor) RemoveIfEmpty(ctx context.Context, key string) (err error) {
+// RejectByAge implements part of the garbage collection responsibilities of an
+// acceptor. It updates the minimum age expected for the provided set of
+// proposers.
+func (a *MemoryAcceptor) RejectByAge(ctx context.Context, ages []Age) (err error) {
 	defer func() {
 		level.Debug(a.logger).Log(
-			"method", "RemoveIfEmpty", "key", key,
+			"method", "RejectByAge", "n", len(ages),
+			"success", err == nil, "err", err,
+		)
+	}()
+
+	a.mtx.Lock()
+	defer a.mtx.Unlock()
+
+	for _, age := range ages {
+		target := a.ages[age.ID]
+		target.Counter = age.Counter
+		a.ages[age.ID] = target
+	}
+
+	return nil
+}
+
+// RemoveIfEqual implements part of the garbage collection responsibilities of
+// an acceptor. It removes the key/value pair identified by key, if the stored
+// value is equal to the tombstone's value.
+func (a *MemoryAcceptor) RemoveIfEqual(ctx context.Context, key string, t Tombstone) (err error) {
+	defer func() {
+		level.Debug(a.logger).Log(
+			"method", "RemoveIfEqual", "key", key, "tombstone", t,
 			"success", err == nil, "err", err,
 		)
 	}()
@@ -155,8 +195,8 @@ func (a *MemoryAcceptor) RemoveIfEmpty(ctx context.Context, key string) (err err
 		return nil // great, no work to do
 	}
 
-	if len(av.value) != 0 {
-		return ErrNotEmpty
+	if !bytes.Equal(av.value, t.State) {
+		return ErrNotEqual
 	}
 
 	delete(a.values, key)
@@ -166,7 +206,10 @@ func (a *MemoryAcceptor) RemoveIfEmpty(ctx context.Context, key string) (err err
 func (a *MemoryAcceptor) dumpValue(key string) []byte {
 	a.mtx.Lock()
 	defer a.mtx.Unlock()
-	av := a.values[key]
+	av, ok := a.values[key]
+	if !ok {
+		return nil
+	}
 	dst := make([]byte, len(av.value))
 	copy(dst, av.value)
 	return dst
@@ -180,4 +223,14 @@ type ConflictError struct {
 
 func (ce ConflictError) Error() string {
 	return fmt.Sprintf("conflict: proposed ballot %s isn't greater than existing ballot %s", ce.Proposed, ce.Existing)
+}
+
+// AgeError is returned by acceptors when there's an age conflict.
+type AgeError struct {
+	Incoming Age
+	Existing Age
+}
+
+func (ae AgeError) Error() string {
+	return fmt.Sprintf("conflict: incoming age %s is younger than existing age %s", ae.Incoming, ae.Existing)
 }

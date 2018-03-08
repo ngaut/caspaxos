@@ -31,6 +31,7 @@ var (
 // update IDs (ballot numbers)."
 type LocalProposer struct {
 	mtx       sync.Mutex
+	age       Age
 	ballot    Ballot
 	preparers map[string]Preparer
 	accepters map[string]Accepter
@@ -39,8 +40,9 @@ type LocalProposer struct {
 
 // NewLocalProposer returns a usable Proposer uniquely identified by id.
 // It communicates with the initial set of acceptors.
-func NewLocalProposer(id uint64, logger log.Logger, initial ...Acceptor) *LocalProposer {
+func NewLocalProposer(id string, logger log.Logger, initial ...Acceptor) *LocalProposer {
 	p := &LocalProposer{
+		age:       Age{Counter: 0, ID: id},
 		ballot:    Ballot{Counter: 0, ID: id},
 		preparers: map[string]Preparer{},
 		accepters: map[string]Accepter{},
@@ -111,7 +113,7 @@ func (p *LocalProposer) propose(ctx context.Context, key string, f ChangeFunc, q
 		logger.Log("broadcast_to", len(p.preparers))
 		for addr, target := range p.preparers {
 			go func(addr string, target Preparer) {
-				value, ballot, err := target.Prepare(ctx, key, b)
+				value, ballot, err := target.Prepare(ctx, key, p.age, b)
 				results <- result{addr, value, ballot, err}
 			}(addr, target)
 		}
@@ -190,7 +192,7 @@ func (p *LocalProposer) propose(ctx context.Context, key string, f ChangeFunc, q
 		logger.Log("broadcast_to", len(p.accepters))
 		for addr, target := range p.accepters {
 			go func(addr string, target Accepter) {
-				err := target.Accept(ctx, key, b, newState)
+				err := target.Accept(ctx, key, p.age, b, newState)
 				results <- result{addr, err}
 			}(addr, target)
 		}
@@ -288,14 +290,19 @@ func (p *LocalProposer) FullIdentityRead(ctx context.Context, key string) (state
 	return state, err
 }
 
-// FastForward ensures that the ballot number's counter is larger than the
-// tombstone. It's used as part of the garbage collection process, to delete
-// keys.
-func (p *LocalProposer) FastForward(tombstone uint64) error {
+// InvalidateAndIncrement performs part (2b) responsibilities of the GC process.
+func (p *LocalProposer) InvalidateAndIncrement(ctx context.Context, key string) (Age, error) {
+	// From the paper, this method should: "invalidate [the] cache associated
+	// with the key ... fast-forward [the ballot number] counter to guarantee
+	// that new ballot numbers are greater than the tombstone's ballot, and
+	// increments the proposer's age."
+
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
-	if p.ballot.Counter < (tombstone + 1) {
-		p.ballot.Counter = (tombstone + 1)
-	}
-	return nil
+
+	// We have no cache associated with the key, because we don't implement the
+	// One-round trip optimization from 2.2.1. So all we have to do is update
+	// our counters.
+	p.ballot.inc() // TODO(pb): is this correct?
+	return p.age.inc(), nil
 }

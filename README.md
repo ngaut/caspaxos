@@ -648,25 +648,16 @@ to reclaim that space with a garbage collection.
 
 > The garbage collection operation (in the background)
 
-The paper stipulates the GC should occur in the background, outside of the
-client request path. That's fair, but to my mind it implies that some kind of
-resilience is necessary, to prevent GC request from being lost. I guess that
-means either persisting GC requests and re/loading them on process start; or,
-perhaps better, implementing them by some kind of continuous stateless process
-which is able to scan the keyspace and identify deleted keys that should be
-deleted _a priori_. 
+The paper stipulates the GC should occur in the background, presumably outside
+of the client request path. To my mind it implies that some kind of resilience
+is necessary, to prevent GC request from being lost. I guess that means either
+persisting GC requests and re/loading them on process start; or, perhaps better,
+implementing them by some kind of continuous stateless process which is able to
+scan the keyspace and identify deleted keys that should be deleted _a priori_. 
 
-For now, let's punt on these interesting questions, and instead bias toward
-correctness, by implementing GC synchronously, as part of the delete request. To
-the best of my knowledge, there's nothing in the description that _requires_ GC
-to occur asynchronously.
-
-One note from below:
-
-> Each step of the GC process is idempotent so if any acceptor or proposer is
-> down the process reschedules itself.
-
-Neat!
+For now, let's punt on these interesting questions, and just implement GC as a
+synchronous function taking the key and tombstone. Later, we can figure out how
+to call this function in the right context or circumstance.
 
 #### Delete step 2a
 
@@ -677,11 +668,9 @@ TODO
 
 #### Delete step 2b
 
-
 TODO
 
 #### Delete step 2c
-
 
 TODO
 
@@ -692,9 +681,22 @@ TODO
 
 TODO
 
-> Invalidation TODO
+> Each step of the GC process is idempotent so if any acceptor or proposer is
+> down the process reschedules itself.
+
+This is a lovely property which means our GC function can _fail fast_ on any
+error, and the calling context can just retry until success. How nice.
+
+> Invalidation and the cache and age check are necessary to eliminate the lost
+> delete anomaly, a situation where a proposer with cached value, or a message
+> delayed by a channel, [will] overwrite the combstone without a causal link.
+> The update of the counters is necessary to avoid the lost update anomaly, a
+> situation when a concurrently-updated value has [a] lesser ballot number,
+> [and] a reader prioritizes the tombstone over the value.
 
 TODO
+
+—
 
 Observe that deletes are more like configuration changes than reads or writes
 (proposals), because the process requires specific access to all proposers and
