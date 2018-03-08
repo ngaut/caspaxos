@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 )
 
@@ -22,7 +21,8 @@ type Proposer interface {
 	RemovePreparer(target Acceptor) error
 	RemoveAccepter(target Acceptor) error
 
-	// This method is for garbage collection, for deletes.
+	// These methods are for garbage collection, for deletes.
+	FullIdentityRead(ctx context.Context, key string) (state []byte, err error)
 	FastForward(tombstone uint64) error
 }
 
@@ -175,44 +175,56 @@ func ShrinkCluster(ctx context.Context, target Acceptor, proposers []Proposer) e
 	return nil
 }
 
+// Tombstone represents the terminal form of a key. Propose some state, likely
+// empty, and collect it with the resulting ballot into a Tombstone, which
+// becomes input to the garbage collection process.
+type Tombstone struct {
+	Ballot Ballot
+	State  []byte
+}
+
 // GarbageCollect removes an empty key as described in section 3.1 "How to
 // delete a record" in the paper. It will continue until the key is successfully
 // garbage collected, or the context is canceled.
-func GarbageCollect(ctx context.Context, key string, delay time.Duration, proposers []Proposer, acceptors []Acceptor, logger log.Logger) error {
-	// From the paper, this process: "(a) Replicates an empty value to all nodes
-	// by executing the identity transform with 2F+1 quorum size. Reschedules
-	// itself if at least one node is down."
+func GarbageCollect(ctx context.Context, key string, t Tombstone, proposers []Proposer, acceptors []Acceptor, logger log.Logger) error {
+	// From the paper: "Each step of the GC process is idempotent so if any
+	// acceptor or proposer is down (i.e. if any step fails) the process
+	// reschedules itself." -- Here we implement as a loop.
 	for {
-		tombstone, err := gcBroadcastIdentity(ctx, key, proposers)
-		if err == context.Canceled {
-			return err // fatal
-		}
-		if err != nil {
-			retry := time.Second // nonfatal
-			level.Debug(logger).Log("broadcast", "failed", "err", err, "retry_in", retry.String())
-			select {
-			case <-time.After(retry):
-				continue
-			case <-ctx.Done():
-				return ctx.Err()
+		// From the paper: "(a) Replicates an empty value to all nodes by
+		// executing the identity transform with max quorum size (2F+1)."
+		{
+			var (
+				proposer = proposers[rand.Intn(len(proposers))]
+				_, err   = proposer.FullIdentityRead(ctx, key)
+			)
+			if err == context.Canceled {
+				return err // fatal
+			}
+			if err != nil {
+				select {
+				case <-time.After(time.Second):
+					continue // retry
+				case <-ctx.Done():
+					return ctx.Err() // canceled
+				}
 			}
 		}
 
-		// From the paper: "(b) For each proposer, fast-forward its counter to
-		// generate ballot numbers greater than the tombstone's number."
-		if err := gcFastForward(ctx, tombstone, proposers); err != nil {
-			return err
+		// From the paper: "(b) Connects to each proposer, invalidates its cache
+		// associated with the removing key, ... fast-forwards its counter to
+		// guarantee that new ballot numbers are greater than the tombstone's
+		// ballot, and increments proposer's age."
+		{
+			// TODO(pb): hmm
 		}
 
-		// From the paper: "(c) Wait some time to make sure that all in-channel
-		// messages with lesser ballots were delivered."
-		time.Sleep(delay)
+		// From the paper: "(c) For each acceptor, asks to reject messages from
+		// proposers if their age is younger than the corresponding age from the
+		// previous step."
 
-		// From the paper: "(d) [Each] acceptor [should] remove the register if
-		// its value is empty."
-		if err := gcRemoveIfEmpty(ctx, key, acceptors); err != nil {
-			return err
-		}
+		// From the paper: "(d) For each acceptor, remove the register if its
+		// value is the tombstone from the 2a step."
 
 		// Done!
 		return nil

@@ -58,16 +58,24 @@ func (p *LocalProposer) Propose(ctx context.Context, key string, f ChangeFunc) (
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
-	state, b, err = p.propose(ctx, key, f)
+	state, b, err = p.propose(ctx, key, f, regularQuorum)
 	if err == ErrPrepareFailed {
 		// allow a single retry, to hide fast-forwards
-		state, b, err = p.propose(ctx, key, f)
+		state, b, err = p.propose(ctx, key, f, regularQuorum)
 	}
 
 	return state, b, err
 }
 
-func (p *LocalProposer) propose(ctx context.Context, key string, f ChangeFunc) (state []byte, b Ballot, err error) {
+// quorumFunc declares how many of n nodes are required.
+type quorumFunc func(n int) int
+
+var (
+	regularQuorum = func(n int) int { return (n / 2) + 1 } // i.e. F+1
+	fullQuorum    = func(n int) int { return n }           // i.e. 2F+1
+)
+
+func (p *LocalProposer) propose(ctx context.Context, key string, f ChangeFunc, qf quorumFunc) (state []byte, b Ballot, err error) {
 	// From the paper: "A client submits the change function to a proposer. The
 	// proposer generates a ballot number B, by incrementing the current ballot
 	// number's counter."
@@ -113,7 +121,7 @@ func (p *LocalProposer) propose(ctx context.Context, key string, f ChangeFunc) (
 		// state as nil; otherwise, it picks the value of the tuple with the
 		// highest ballot number."
 		var (
-			quorum          = (len(p.preparers) / 2) + 1
+			quorum          = qf(len(p.preparers))
 			biggestConfirm  Ballot
 			biggestConflict Ballot
 		)
@@ -190,7 +198,7 @@ func (p *LocalProposer) propose(ctx context.Context, key string, f ChangeFunc) (
 		// From the paper: "The proposer waits for the F+1 confirmations."
 		// Observe that once we've got confirmation from a quorum of accepters,
 		// we ignore any subsequent messages.
-		quorum := (len(p.accepters) / 2) + 1
+		quorum := qf(len(p.accepters))
 		for i := 0; i < cap(results) && quorum > 0; i++ {
 			result := <-results
 			if result.err != nil {
@@ -267,8 +275,22 @@ func (p *LocalProposer) RemoveAccepter(target Acceptor) error {
 	return nil
 }
 
+// FullIdentityRead performs an identity read on the given key with a quorum
+// size of 100%. It's used as part of the garbage collection process, to delete
+// keys.
+func (p *LocalProposer) FullIdentityRead(ctx context.Context, key string) (state []byte, err error) {
+	identity := func(x []byte) []byte { return x }
+	state, _, err = p.propose(ctx, key, identity, fullQuorum)
+	if err == ErrPrepareFailed {
+		// allow a single retry, to hide fast-forwards
+		state, _, err = p.propose(ctx, key, identity, fullQuorum)
+	}
+	return state, err
+}
+
 // FastForward ensures that the ballot number's counter is larger than the
-// tombstone. It's used by the garbage collection process to delete keys.
+// tombstone. It's used as part of the garbage collection process, to delete
+// keys.
 func (p *LocalProposer) FastForward(tombstone uint64) error {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
